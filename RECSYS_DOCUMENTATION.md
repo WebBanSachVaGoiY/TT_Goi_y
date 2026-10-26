@@ -23,6 +23,14 @@
 
 ---
 
+> ### 📌 Trạng thái triển khai (cập nhật 2026)
+> * ✅ **Đã triển khai trong mã nguồn:** §4 (Tracking), §5 (CBF), §6 (ALS), §7 (Cold-Start), §9 (Redis Cache + fallback RAM), §10 (Serving APIs — bao gồm cả co-purchase FBT `ALSO_BOUGHT`, endpoint trigger train, và nút "Huấn luyện lại gợi ý" trên trang Admin).
+> * 🚧 **Chưa triển khai (TODO):** §11 (Evaluation Metrics — Precision@K/Recall@K/NDCG@K/Coverage) và §12 (Docker Compose đóng gói 5 dịch vụ).
+>
+> Bảng dưới đây mô tả **đặc tả thiết kế**; phần nào đã có code sẽ được ghi chú rõ.
+
+---
+
 ## 1. TỔNG QUAN BÀI TOÁN & THÁCH THỨC
 
 Trong một nền tảng thương mại điện tử bán sách trực tuyến, việc hiển thị danh sách sách tĩnh sẽ khiến khách hàng gặp khó khăn trong việc tìm kiếm tựa sách phù hợp. Hệ thống Recommender System (RecSys) đóng vai trò là "người bán hàng thông minh", cá nhân hóa trải nghiệm của từng độc giả.
@@ -70,16 +78,23 @@ flowchart TD
 
         DB_Logs --> ALS_Engine["<b>Collaborative Filtering Engine</b><br/>• Time-Decay: w * exp(-λΔt)<br/>• Bão hòa: R = 1 + ln(1+w)<br/>• Implicit Feedback ALS (k=32)<br/>• Phân rã User Factor & Item Factor"]
         ALS_Engine -->|Bulk Write Top-20| DB_Rec[("user_recommendations")]
+
+        DB_Orders[("orders & order_items")] --> CoPurchase_Engine["<b>Co-Purchase Engine (FBT)</b><br/>• Dựng giỏ hàng theo đơn<br/>• Loại đơn CANCELLED/RETURNED<br/>• Top-K 2 chiều"]
+        CoPurchase_Engine -->|Bulk Write Top-10 (ALSO_BOUGHT)| DB_Sim
     end
 
     subgraph ServingLayer ["4. SERVING & CACHING LAYER (Spring Boot)"]
-        DB_Sim --> Svc_Related["getRelatedBooks(bookId)"]
-        DB_Rec --> Svc_ForYou["getForYouRecommendations(userId)"]
-        ColdEngine["Cold-Start Engine<br/>(Top Bán chạy + Đánh giá cao)"] -.->|Fallback khi interactions < 5| Svc_ForYou
-        
-        Svc_ForYou --> Redis[("REDIS CACHE (TTL 2h)<br/>recsys:for_you:{userId}")]
+        DB_Sim --> Svc_Related["getRelated(bookId)"]
+        DB_Sim --> Svc_Fbt["getFrequentlyBoughtTogether(bookId)"]
+        DB_Rec --> Svc_ForYou["getForYou(userId)"]
+        ColdEngine["Cold-Start Engine<br/>(Top Bán chạy + Đánh giá cao)"] -.->|Fallback khi interactions < threshold| Svc_ForYou
+        Catalog[("books.soldCount + averageRating")] -.->|Guest / Trending| Svc_Trending["getTrending()"]
+
+        Svc_ForYou --> Redis[("REDIS CACHE<br/>for_you / related / fbt / trending")]
         Redis --> UI_Home
+        Svc_Trending --> UI_Home
         Svc_Related --> UI_Detail
+        Svc_Fbt --> UI_Detail
     end
 ```
 
@@ -269,7 +284,7 @@ Thuật toán giải bài toán qua các vòng lặp luân phiên (15 epochs):
 
 ```mermaid
 flowchart TD
-    UserReq["User yêu cầu gợi ý: GET /recommendations/for-you"] --> CheckCount{"Số tương tác của User >= 5?"}
+    UserReq["User yêu cầu gợi ý: GET /recommendations/for-you"] --> CheckCount{"Số tương tác của User >= app.recsys.user-cold-start-threshold?"}
     
     CheckCount -->|Có (Warm User)| ALS_Query["Query bảng user_recommendations<br/>(Do ALS tính toán)"]
     CheckCount -->|Không (Cold-Start User)| ColdEngine["Cold-Start Fallback Engine"]
@@ -289,6 +304,11 @@ flowchart TD
 2. **Đối với Sách mới nhập kho (Cold-Start Item):**
    * Được giải quyết triệt để nhờ thuật toán **Content-Based Filtering**: Sách mới chỉ cần có tiêu đề, tác giả và danh mục là lập tức tìm được danh sách sách tương tự để xuất hiện trên trang chi tiết sách mà không cần đợi lượt mua nào.
 
+> ✅ **Đã triển khai** tại `RecommendationServiceImpl` (Spring Boot):
+> * Cold-start user: đếm tương tác qua `UserBookInteractionRepository.countByUserId`; nếu `< app.recsys.user-cold-start-threshold` (mặc định 5) hoặc user chưa có gợi ý → gộp `findTrendingWithCategory` (soldCount) + `findTopRatedWithCategory` (averageRating ≥ 4.0) và loại trùng.
+> * Khách vãng lai (`userId == null`) cũng dùng nhánh này (chính là endpoint `trending`).
+> * Cold-start item: nếu `book_similarities` rỗng cho một sách, `getRelated` fallback sang các sách cùng danh mục (`findByCategoryExcludingWithCategory`).
+
 ---
 
 ## 8. KỊCH BẢN SINH DỮ LIỆU GIẢ LẬP (SYNTHETIC DATA SEEDER)
@@ -304,6 +324,8 @@ flowchart TD
 
 * **Quy mô nạp:** **50 người dùng mẫu**, **4.000 – 6.000 bản ghi tương tác**, timestamp rải đều trong **60 ngày gần nhất** để kiểm tra tính năng suy giảm thời gian Time-Decay.
 
+> ⚠️ **Lưu ý về dữ liệu FBT:** `seed_synthetic_data.py` hiện chỉ sinh bảng `user_book_interactions` (phục vụ CBF/ALS). Thuật toán **Co-Purchase (FBT)** đọc từ `order_items JOIN orders`, nên trên một DB chỉ có dữ liệu seed thuần thì `/frequently-bought-together/{bookId}` sẽ trả rỗng cho tới khi có đơn hàng thật (hoặc seeder được mở rộng để sinh thêm `orders`/`order_items`).
+
 ---
 
 ## 9. CHIẾN LƯỢC TÍCH HỢP REDIS CACHING & TỐI ƯU TỐC ĐỘ
@@ -318,35 +340,58 @@ RecSys là phân hệ có tần suất đọc cực lớn (Read-heavy). Việc t
 ```
 
 ### 9.1. Các Khóa Cache (Cache Keys) & Thời Gian Sống (TTL)
-1. **Gợi ý cá nhân hóa:** Key `recsys:for_you:{userId}` — TTL: **2 giờ**.
+1. **Gợi ý cá nhân hóa:** Key `recsys:for_you:{userId}` — TTL: **2 giờ** (`app.recsys.cache-ttl-hours`).
 2. **Sách tương tự:** Key `recsys:related:{bookId}` — TTL: **12 giờ**.
-3. **Sách thịnh hành:** Key `recsys:trending` — TTL: **1 giờ**.
-4. **Danh mục sách:** Key `catalog:categories:all` — TTL: **24 giờ**.
+3. **Thường được mua cùng (FBT):** Key `recsys:fbt:{bookId}` — TTL: **12 giờ**.
+4. **Sách thịnh hành:** Key `recsys:trending` — TTL: **1 giờ**.
+5. **Danh mục sách:** Key `catalog:categories:all` — TTL: **24 giờ**.
 
 ### 9.2. Cơ Chế Fallback An Toàn (Graceful Degradation)
 Trong môi trường phát triển cục bộ (Local Dev), nếu máy tính chưa bật dịch vụ Redis trên cổng 6379, cấu hình Cache trong Spring Boot sẽ tự động fallback sang `ConcurrentMapCacheManager` (RAM nội bộ) hoặc truy vấn trực tiếp MariaDB mà **không bao giờ gây lỗi crash ứng dụng**.
+
+> ✅ **Đã triển khai** tại `CacheConfig` (Spring Boot):
+> * Khi khởi động, thử `ping()` Redis; nếu OK → `RedisCacheManager` với TTL riêng cho từng cache (`FOR_YOU` theo cấu hình, `RELATED`/`FBT` 12h, `TRENDING` 1h); nếu không → `ConcurrentMapCacheManager`.
+> * `CacheErrorHandler` nuốt mọi lỗi cache runtime (chỉ log cảnh báo) → Redis chết giữa chừng cũng không làm hỏng request gợi ý.
+> * Cần dependency `spring-boot-starter-cache` + `spring-boot-starter-data-redis` (đã thêm trong `build.gradle`).
+> * Sau mỗi lần admin trigger train, `RecSysAdminServiceImpl` **xoá toàn bộ** 4 cache gợi ý để tránh dữ liệu cũ.
 
 ---
 
 ## 10. TẦNG PHỤC VỤ (SERVING APIS) & HIỂN THỊ GIAO DIỆN
 
 ### 10.1. Danh Sách Endpoint Phục Vụ Trong Spring Boot (`book-runner`)
+
+> ✅ **Đã triển khai** tại `RecommendationController` (`/api/v1/recommendations`) và `AdminRecommendationController`.
+
 | Endpoint | Phương thức | Phân quyền | Mô tả |
 |:---|:---:|:---:|:---|
-| `/api/v1/recommendations/for-you` | `GET` | `authenticated` | Trả về Top 10-20 sách gợi ý cá nhân hóa (có Cold-Start Fallback) |
-| `/api/v1/recommendations/related/{bookId}` | `GET` | `permitAll` | Trả về Top 4-10 sách tương đồng nội dung |
-| `/api/v1/recommendations/trending` | `GET` | `permitAll` | Trả về Top sách hot dựa trên `soldCount` 30 ngày qua |
+| `/api/v1/recommendations/for-you` | `GET` | `authenticated` | Top sách gợi ý cá nhân hóa (`?limit=`, mặc định 10, tối đa `app.recsys.max-recommendation-limit`). Có Cold-Start Fallback khi user ít tương tác hoặc chưa có dữ liệu ALS |
+| `/api/v1/recommendations/related/{bookId}` | `GET` | `permitAll` | Top sách tương đồng nội dung (CBF). Fallback sang sách cùng danh mục khi chưa có dữ liệu mô hình |
+| `/api/v1/recommendations/frequently-bought-together/{bookId}` | `GET` | `permitAll` | Top sách thường được mua cùng (Co-Purchase, `similarity_type = ALSO_BOUGHT`) |
+| `/api/v1/recommendations/trending` | `GET` | `permitAll` | Sách bán chạy/nổi bật — dùng cho khách vãng lai (gộp `soldCount` + `averageRating ≥ 4.0`) |
+| `/api/v1/admin/recommendations/train` | `POST` | `ROLE_ADMIN` | Trigger huấn luyện lại RecSys (`?type=all\|content-based\|collaborative\|co-purchase`), sau đó xoá cache gợi ý |
 
 ### 10.2. Danh Sách Endpoint Huấn Luyện Trong FastAPI (`TT_Goi_y`)
+
+> ✅ **Đã triển khai** tại `app/api/recsys_router.py`.
+
 | Endpoint | Phương thức | Mô tả |
 |:---|:---:|:---|
-| `/api/recsys/train/content-based` | `POST` | Kích hoạt huấn luyện TF-IDF & ghi đè bảng `book_similarities` |
-| `/api/recsys/train/collaborative` | `POST` | Kích hoạt huấn luyện ALS & ghi đè bảng `user_recommendations` |
+| `/api/recsys/train/content-based` | `POST` | Huấn luyện TF-IDF & ghi đè bảng `book_similarities` |
+| `/api/recsys/train/collaborative` | `POST` | Huấn luyện ALS & ghi đè bảng `user_recommendations` |
+| `/api/recsys/train/co-purchase` | `POST` | Huấn luyện Co-Purchase (FBT) từ `order_items JOIN orders` & ghi `book_similarities` với type `ALSO_BOUGHT` |
+| `/api/recsys/train/all` | `POST` | Chạy tuần tự cả 3 thuật toán trên (CBF → Co-Purchase → ALS) |
 | `/api/recsys/health` | `GET` | Kiểm tra kết nối Database MariaDB và tình trạng Service |
+
+Các endpoint **đọc** (debug/Swagger — Spring Boot vẫn là gateway chính cho Frontend):
+`GET /api/recsys/users/{user_id}/recommendations`, `GET /api/recsys/books/{book_id}/similar`,
+`GET /api/recsys/books/{book_id}/frequently-bought-together`, `GET /api/recsys/trending`.
 
 ---
 
 ## 11. ĐÁNH GIÁ HIỆU NĂNG MÔ HÌNH (EVALUATION METRICS)
+
+> 🚧 **Chưa triển khai (TODO).** Phần dưới đây là đặc tả kế hoạch; chưa có script/hàm đánh giá nào trong mã nguồn hiện tại.
 
 Để kiểm chứng chất lượng của mô hình gợi ý, hệ thống sử dụng các chỉ số đánh giá chuẩn khoa học dữ liệu:
 1. **Precision@K ($K=10$):** Tỷ lệ các cuốn sách được gợi ý mà người dùng thực sự quan tâm trong tập kiểm thử (Test Set).
@@ -358,6 +403,8 @@ Trong môi trường phát triển cục bộ (Local Dev), nếu máy tính chư
 ---
 
 ## 12. ĐÓNG GÓI HỆ THỐNG (DEVOPS & DOCKER COMPOSE)
+
+> 🚧 **Chưa triển khai (TODO).** Chưa có `docker-compose.yml`/`Dockerfile` trong repo; phần dưới đây là kế hoạch đóng gói.
 
 Toàn bộ hệ thống sẽ được đóng gói trong một file `docker-compose.yml` duy nhất khởi chạy 5 dịch vụ liên hoàn:
 * **Service 1:** `mariadb:11` (Port 3306) — Lưu trữ dữ liệu quan hệ.

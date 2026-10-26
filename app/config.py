@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     ALS_ALPHA: float = 40.0         # Hệ số confidence: c_ui = 1 + alpha * R_ui
     ALS_TOP_K: int = 20             # Số sách gợi ý ghi vào user_recommendations
 
+    # Item-Item Co-Purchase (Frequently Bought Together)
+    # Nguồn: order_items JOIN orders (loại đơn CANCELLED/RETURNED)
+    CO_PURCHASE_SIMILARITY_TYPE: str = "ALSO_BOUGHT"
+    CO_PURCHASE_TOP_K: int = 10          # Số sách "mua cùng" tối đa mỗi sách
+    CO_PURCHASE_MIN_COUNT: int = 1       # Số đơn tối thiểu cùng chứa cặp sách để giữ lại
+
+    # Hybrid Recommender (ALS + CBF)
+    HYBRID_ALPHA: float = 0.65      # Trọng số Collaborative Filtering (1 - alpha là Content-Based)
+    HYBRID_TOP_K: int = 20          # Số lượng gợi ý cá nhân hóa cho mỗi user
+    ITEM_COLD_START_THRESHOLD: int = 5
+
     # Time-Decay: w(e) = w_base * exp(-λ * Δt)
     # λ = 0.05 → chu kỳ bán rã ~14 ngày
     TIME_DECAY_LAMBDA: float = 0.05

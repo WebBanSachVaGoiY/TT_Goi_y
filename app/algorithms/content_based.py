@@ -13,6 +13,7 @@ Luồng xử lý:
 Kết quả: bảng book_similarities với similarity_type='CONTENT_BASED'
 """
 import logging
+from datetime import datetime
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -149,7 +150,8 @@ def run_content_based_training(db: Session) -> dict:
                 "book_id_2": book_ids[j],
                 "similarity_type": settings.CBF_SIMILARITY_TYPE,
                 "score": round(score, 6),
-                "rank_order": rank + 1
+                "rank_order": rank + 1,
+                "updated_at": datetime.now()
             })
 
     logger.info(f"📊 [CBF] Tính được {len(similarity_records)} cặp tương đồng (top_{top_k} × {len(books)} sách).")

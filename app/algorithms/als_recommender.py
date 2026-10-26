@@ -16,6 +16,7 @@ Luồng xử lý:
 Kết quả: bảng user_recommendations với recommendation_type='FOR_YOU', algorithm='ALS'
 """
 import os
+import json
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import logging
 import numpy as np
@@ -25,10 +26,22 @@ from implicit.als import AlternatingLeastSquares
 from sqlalchemy.orm import Session
 from app.models.interaction import UserBookInteraction
 from app.models.recommendation import UserRecommendation
+from app.models.book import Book
+from app.models.user import User
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+class InteractionRecord:
+    """Đối tượng chuẩn hoá biểu diễn sự kiện tương tác trong bộ nhớ."""
+    def __init__(self, user_id: int, book_id: int, interaction_type: str, weight: float, created_at: datetime):
+        self.user_id = user_id
+        self.book_id = book_id
+        self.interaction_type = interaction_type
+        self.weight = weight
+        self.created_at = created_at
 
 
 def _compute_time_decay_weight(
@@ -128,6 +141,63 @@ def _build_interaction_matrix(interactions: list) -> tuple:
     return sparse_matrix, user_id_to_idx, book_id_to_idx, idx_to_user_id, idx_to_book_id
 
 
+def _load_all_interactions(db: Session) -> tuple[list, set]:
+    """
+    Tải toàn bộ tương tác từ 2 nguồn:
+    1. Tương tác THẬT từ MariaDB (user_book_interactions).
+    2. Tương tác MẪU từ file offline data/synthetic_interactions.json (nếu có).
+
+    Returns:
+        tuple: (all_interactions, real_user_ids)
+    """
+    real_user_ids = set(r[0] for r in db.query(User.id).all())
+    interactions = []
+
+    # 1. Đọc tương tác THẬT từ DB
+    db_rows = db.query(UserBookInteraction).all()
+    for row in db_rows:
+        interactions.append(InteractionRecord(
+            user_id=row.user_id,
+            book_id=row.book_id,
+            interaction_type=row.interaction_type,
+            weight=float(row.weight),
+            created_at=row.created_at
+        ))
+    logger.info(f"📝 [ALS] Đã nạp {len(db_rows)} tương tác THẬT từ MariaDB.")
+
+    # 2. Đọc tương tác MẪU từ file JSON ngoại tuyến (nếu tồn tại)
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    dataset_file = os.path.join(base_dir, "data", "synthetic_interactions.json")
+    if os.path.exists(dataset_file):
+        try:
+            with open(dataset_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            loaded_synth = 0
+            for item in data:
+                raw_time = item.get("created_at")
+                if isinstance(raw_time, str):
+                    try:
+                        dt = datetime.fromisoformat(raw_time)
+                    except Exception:
+                        dt = datetime.now(timezone.utc)
+                else:
+                    dt = datetime.now(timezone.utc)
+
+                interactions.append(InteractionRecord(
+                    user_id=item["user_id"],
+                    book_id=item["book_id"],
+                    interaction_type=item["interaction_type"],
+                    weight=float(item["weight"]),
+                    created_at=dt
+                ))
+                loaded_synth += 1
+            logger.info(f"📁 [ALS] Đã nạp thêm {loaded_synth} tương tác MẪU từ file ngoại tuyến: {dataset_file}")
+        except Exception as e:
+            logger.warning(f"⚠️ [ALS] Không thể đọc file dataset mẫu: {e}")
+
+    return interactions, real_user_ids
+
+
 def run_collaborative_filtering_training(db: Session) -> dict:
     """
     Kích hoạt toàn bộ pipeline Collaborative Filtering ALS với Implicit Feedback.
@@ -143,15 +213,15 @@ def run_collaborative_filtering_training(db: Session) -> dict:
     logger.info("=" * 60)
 
     # ---------------------------------------------------------------
-    # BƯỚC 1: Đọc toàn bộ dữ liệu tương tác
+    # BƯỚC 1: Đọc toàn bộ dữ liệu tương tác (DB thật + Dataset mẫu)
     # ---------------------------------------------------------------
-    interactions = db.query(UserBookInteraction).all()
+    interactions, real_user_ids = _load_all_interactions(db)
     if not interactions:
-        msg = "Bảng user_book_interactions trống. Cần chạy seed_synthetic_data.py trước."
+        msg = "Không có tương tác nào trong DB hoặc file dataset. Cần chạy seed_synthetic_data.py trước."
         logger.warning(f"⚠️ [ALS] {msg}")
         return {"status": "skipped", "reason": msg}
 
-    logger.info(f"📝 [ALS] Đã tải {len(interactions)} bản ghi tương tác.")
+    logger.info(f"📊 [ALS] Tổng số tương tác đưa vào ma trận: {len(interactions)}.")
 
     # ---------------------------------------------------------------
     # BƯỚC 2 & 3: Xây dựng ma trận tương tác (Time-Decay + Log Saturation)
@@ -208,8 +278,16 @@ def run_collaborative_filtering_training(db: Session) -> dict:
     n_users = sparse_matrix.shape[0]
     recommendation_records = []
 
+    # Lấy danh sách book_id đang hoạt động (active = True) để không gợi ý sách ngừng kinh doanh
+    active_book_ids = set(r[0] for r in db.query(Book.id).filter(Book.active == True).all())
+
     for user_idx in range(n_users):
         user_id = idx_to_user_id[user_idx]
+
+        # CHỈ GỢI Ý CHO USER THẬT (Bỏ qua các virtual persona users để giữ DB sạch)
+        if user_id not in real_user_ids:
+            continue
+
         user_bought = bought_books.get(user_id, set())
 
         # Lấy nhiều hơn top_k để sau khi filter BUY vẫn đủ, nhưng không vượt quá tổng số items
@@ -236,6 +314,8 @@ def run_collaborative_filtering_training(db: Session) -> dict:
             book_id = idx_to_book_id.get(int(item_idx_raw))
             if book_id is None:
                 continue
+            if book_id not in active_book_ids:
+                continue  # Bỏ qua sách đã ngừng kinh doanh (active = False)
             if book_id in seen_book_ids:
                 continue  # Bỏ qua sách đã mua hoặc đã được đưa vào gợi ý
             seen_book_ids.add(book_id)
@@ -246,7 +326,8 @@ def run_collaborative_filtering_training(db: Session) -> dict:
                 "recommendation_type": settings.RECOMMENDATION_TYPE,  # 'FOR_YOU'
                 "algorithm": settings.ALGORITHM_NAME,                  # 'ALS'
                 "score": float(score),
-                "rank_order": rank
+                "rank_order": rank,
+                "updated_at": datetime.now()
             })
             rank += 1
 
